@@ -15,6 +15,71 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+# rotary pos emb helpers (torch.jit.script does not seem to support staticmethod...)
+def rotate_half(x):
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+class RotaryEmbedding(torch.nn.Module):
+    """Implementation of RotaryEmbedding from GPT-NeoX.
+    This implementation is design to operate on queries and keys that are compatible with
+    [batch_size, n_heads_per_partition, seq_len, head_dim] (e.g. MinGPTAttention format).
+    """
+
+    def __init__(
+        self,
+        head_dim: int,
+        base=10000,
+    ):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        # (torch.arange(0, head_dim, 2) creates a tensor of [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, ...] up to head_dim
+        # we then divide each element by head_dim
+        # then raise base to the power of each element
+        # then divide 1.0 by each element
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.head_dim = head_dim
+        self.seq_len_cached = None
+        self.batch_size_cached = None
+        self.cos_cached: torch.Tensor | None = None
+        self.sin_cached: torch.Tensor | None = None
+
+    def cos_sin(
+        self,
+        seq_len: int,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) -> torch.Tensor:
+        if seq_len != self.seq_len_cached:
+            self.seq_len_cached = seq_len
+            t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            # multiply each element of t with each element of inv_freq
+            # i,j->ij is equivalent to using matmul like this:
+            # freqs = torch.matmul(t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1).to(device)
+            # concat another copy of freqs to itself along the last dimension
+
+            if dtype in [torch.float16, torch.bfloat16]:
+                emb = emb.float()
+
+            self.cos_cached = emb.cos()[None, :, :]
+            # [None, :, :] adds a new dimension at the beginning
+            self.sin_cached = emb.sin()[None, :, :]
+            # [None, :, :] adds a new dimension at the beginning
+            #calculates the sine of each value in the tensor. The input is in radians
+
+            self.cos_cached = self.cos_cached.type(dtype)
+            self.sin_cached = self.sin_cached.type(dtype)
+        
+        return self.cos_cached, self.sin_cached
+
+    def forward(self, q, k):
+        batch, seq_len, head_dim = q.shape
+        cos, sin = self.cos_sin(seq_len, q.device, q.dtype)
+        return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
+
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -32,7 +97,11 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.q_attn = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.k_attn = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.v_attn = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
@@ -41,6 +110,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.rotary = RotaryEmbedding(config.n_embd // config.n_head)
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -49,31 +119,55 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+    def forward(self, query, key, value, attn_mask=None, is_causal=True):
+        B, T, C = query.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # before split
+        q = self.q_attn(query) # (B, T, C)
+        k = self.k_attn(key) # (B, T, C)
+        v = self.v_attn(value) # (B, T, C)
+        # current shape B, T, embed_dim
+        # create (batch_size * self.num_heads, query_length, self.head_dim)
+        query_layer = q.transpose(1, 2).reshape(B * self.n_head, T, C // self.n_head)
+        key_layer = k.transpose(1, 2).reshape(B * self.n_head, T, C // self.n_head)
+        value_layer = v.transpose(1, 2).reshape(B * self.n_head, T, C // self.n_head)
+        past_kv_length = 0
+
+        # rotary embeddings
+        query_layer, key_layer = self.rotary(query_layer, key_layer)
+        
+        k = key_layer.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = query_layer.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = value_layer.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0, is_causal=is_causal)
         else:
             # manual implementation of attention
+            # k.transpose(-2, -1): (B, nh, T, hs) -> (B, nh, hs, T)
+            # q @ k: first operation, for each B in batch, for each H in nh, multiply each element of q T dim with each element of k's T dim and sum
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+            attn_output = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+            
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
+        attn_output = self.resid_dropout(self.c_proj(attn_output))
+        return attn_output 
+
+
+
+
+
 
 class MLP(nn.Module):
 
@@ -100,20 +194,73 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, query, key, value, attn_mask=None, is_causal=True):
+        # use layer norm on inputs
+        query = self.ln_1(query)
+        key = self.ln_1(key)
+        value = self.ln_1(value)
+
+        # self attention
+        x = query + self.attn(query,key,value, attn_mask=attn_mask, is_causal=is_causal)
+            
         x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
+    block_size: int = 512
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(config)
+        self.block = Block(config)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, query, key, value, attn_mask=None, is_causal=True):
+        # use layer norm on inputs
+        query = self.ln_1(query)
+        key = self.ln_1(key)
+        value = self.ln_1(value)
+
+        attention = self.attn(query,query,query, attn_mask=attn_mask, is_causal=is_causal)
+
+        x = query + self.dropout(attention)
+
+        out = self.block(x,key,value, attn_mask=attn_mask, is_causal=is_causal)
+        return out
+
+
+class Encoder(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+        self.drop = nn.Dropout(config.dropout)
+        self.h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]) # will want dif num of encoder layers than decoder layers
+        self.ln_f = LayerNorm(config.n_embd, bias=config.bias)
+
+    
+    def forward(self, x):
+        # forward the GPT model itself
+        tok_emb = self.wte(x) # token embeddings of shape (b, t, n_embd)
+        x = self.drop(tok_emb)
+        
+        for block in self.h:
+            x = block(x,x,x, is_causal=False)
+        
+        x = self.ln_f(x)
+
+        return x
+
 
 class GPT(nn.Module):
 
@@ -123,19 +270,14 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
+        self.encoder = Encoder(config)
+        self.decoder = Decoder(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.decoder.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
@@ -155,8 +297,6 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -171,15 +311,10 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+        
+        enc_out = self.encoder(idx)
+        x = self.decoder(idx, enc_out)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
