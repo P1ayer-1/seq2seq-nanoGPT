@@ -261,6 +261,47 @@ class Encoder(nn.Module):
 
         return x
 
+class Decoder(nn.Module):
+    def __init__(
+        self,
+        trg_vocab_size,
+        embed_size,
+        num_layers,
+        heads,
+        forward_expansion,
+        dropout,
+        device,
+        max_length,
+    ):
+        super(Decoder, self).__init__()
+        self.device = device
+        self.word_embedding = nn.Embedding(trg_vocab_size, embed_size)
+        self.position_embedding = nn.Embedding(max_length, embed_size)
+
+        self.layers = nn.ModuleList(
+            [
+                DecoderBlock(embed_size, heads, forward_expansion, dropout, device, max_length)
+                for _ in range(num_layers)
+            ]
+        )
+        self.fc_out = nn.Linear(embed_size, trg_vocab_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, enc_out, src_mask, trg_mask):
+        N, seq_length = x.shape
+        positions = torch.arange(0, seq_length).expand(N, seq_length).to(self.device)
+        # arrange creates a tensor with values from 0 to seq_length
+        # expand creates a tensor with the same shape as x (the input)
+        x = self.dropout((self.word_embedding(x) + self.position_embedding(positions)))
+        # add the positional embedding to the word embedding
+
+        for layer in self.layers:
+            x = layer(x, enc_out, enc_out, src_mask, trg_mask) #enc_out is value, key
+
+        out = self.fc_out(x) # call linear layer
+
+        return out
+
 
 class GPT(nn.Module):
 
